@@ -80,7 +80,7 @@ public:
 #ifdef LILU_KEXTPATCH_SUPPORT
 	struct KextInfo {
 		static constexpr size_t Unloaded {0};
-		enum SysFlags : size_t {
+		enum SysFlags : uint64_t {
 			Loaded,      // invoke for kext if it is already loaded
 			Reloadable,  // allow the kext to unload and get patched again
 			Disabled,    // do not load this kext (formerly achieved pathNum = 0, this no longer works)
@@ -89,7 +89,7 @@ public:
 			Reserved,
 			SysFlagNum,
 		};
-		static constexpr size_t UserFlagNum {sizeof(size_t)-SysFlagNum};
+		static constexpr uint64_t UserFlagNum {sizeof(uint64_t)-SysFlagNum};
 		static_assert(UserFlagNum > 0, "There should be at least one user flag");
 		const char *id {nullptr};
 		const char **paths {nullptr};
@@ -107,7 +107,7 @@ public:
 		}
 	};
 
-	static_assert(sizeof(KextInfo) == 5 * sizeof(size_t), "KextInfo is no longer ABI compatible");
+	static_assert(sizeof(KextInfo) == 4 * sizeof(size_t) + sizeof(uint64_t), "KextInfo is no longer ABI compatible");
 #endif /* LILU_KEXTPATCH_SUPPORT */
 
 	/**
@@ -384,7 +384,7 @@ public:
 	 *
 	 *  @return wrapper pointer or 0 on success
 	 */
-	EXPORT mach_vm_address_t routeFunction(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true);
+	EXPORT mach_vm_address_t routeFunction(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true) DEPRECATE("Use routeMultiple where possible");
 
 	/**
 	 *  Route function to function with long jump
@@ -397,7 +397,7 @@ public:
 	 *
 	 *  @return wrapper pointer or 0 on success
 	 */
-	EXPORT mach_vm_address_t routeFunctionLong(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true);
+	EXPORT mach_vm_address_t routeFunctionLong(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true) DEPRECATE("Use routeMultiple where possible");
 
 	/**
 	 *  Route function to function with short jump
@@ -410,7 +410,7 @@ public:
 	 *
 	 *  @return wrapper pointer or 0 on success
 	 */
-	EXPORT mach_vm_address_t routeFunctionShort(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true);
+	EXPORT mach_vm_address_t routeFunctionShort(mach_vm_address_t from, mach_vm_address_t to, bool buildWrapper=false, bool kernelRoute=true, bool revertible=true) DEPRECATE("Use routeMultiple where possible");
 
 	/**
 	 *  Route block at assembly level
@@ -592,26 +592,45 @@ public:
 	}
 
 	/**
+	 *  Find one pattern with optional masking within a block of memory
+	 *
+	 *  @param pattern           pattern to search
+	 *  @param patternMask           pattern mask
+	 *  @param patternSize           size of pattern
+	 *  @param data           a block of memory
+	 *  @param dataSize           size of memory
+	 *  @param dataOffset           data offset, to be set by this function
+	 *
+	 *  @return true if pattern is found in data
+	 */
+	EXPORT static bool findPattern(const void *pattern, const void *patternMask, size_t patternSize, const void *data, size_t dataSize, size_t *dataOffset);
+
+	/**
+	 *  Simple find and replace with masking in kernel memory.
+	 */
+	EXPORT static bool findAndReplaceWithMask(void *data, size_t dataSize, const void *find, size_t findSize, const void *findMask, size_t findMaskSize, const void *replace, size_t replaceSize, const void *replaceMask, size_t replaceMaskSize, size_t count=0, size_t skip=0);
+
+	/**
 	 *  Simple find and replace in kernel memory.
 	 */
 	static inline bool findAndReplace(void *data, size_t dataSize, const void *find, size_t findSize, const void *replace, size_t replaceSize) {
-		void *res;
-		if (UNLIKELY((res = lilu_os_memmem(data, dataSize, find, findSize)) != nullptr)) {
-			if (UNLIKELY(MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) != KERN_SUCCESS)) {
-				SYSLOG("patcher", "failed to obtain write permissions for f/r");
-				return false;
-			}
+		return findAndReplaceWithMask(data, dataSize, find, findSize, nullptr, 0, replace, replaceSize, nullptr, 0, 0, 0);
+	}
 
-			lilu_os_memcpy(res, replace, replaceSize);
+	/**
+	 *  Simple find and replace in kernel memory but require both `find` and `replace` buffers to have the same length
+	 */
+	template <size_t N>
+	static inline bool findAndReplace(void *data, size_t dataSize, const uint8_t (&find)[N], const uint8_t (&replace)[N]) {
+		return findAndReplace(data, dataSize, find, N, replace, N);
+	}
 
-			if (UNLIKELY(MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock) != KERN_SUCCESS)) {
-				SYSLOG("patcher", "failed to restore write permissions for f/r");
-			}
-
-			return true;
-		}
-
-		return false;
+	/**
+	 *  Simple find and replace with masking in kernel memory but require both `find` and `replace` buffers and masking buffers to have the same length
+	 */
+	template <size_t N>
+	static inline bool findAndReplaceWithMask(void *data, size_t dataSize, const uint8_t (&find)[N], const uint8_t (&findMask)[N], const uint8_t (&replace)[N], const uint8_t (&replaceMask)[N], size_t count, size_t skip) {
+		return findAndReplaceWithMask(data, dataSize, find, N, findMask, N, replace, N, replaceMask, N, count, skip);
 	}
 
 private:
@@ -648,11 +667,12 @@ private:
 	/**
 	 *  Read previous jump destination from function
 	 *
-	 *  @param from         formerly routed function
+	 *  @param from          formerly routed function
+	 *  @param jumpType previous jump type
 	 *
 	 *  @return wrapper pointer on success or 0
 	 */
-	mach_vm_address_t readChain(mach_vm_address_t from);
+	mach_vm_address_t readChain(mach_vm_address_t from, JumpType &jumpType);
 
 	/**
 	 *  Created routed trampoline page
@@ -698,29 +718,74 @@ private:
 	 */
 	bool routeMultipleInternal(size_t id, RouteRequest *requests, size_t num, mach_vm_address_t start=0, size_t size=0, bool kernelRoute=true, bool force=false, JumpType jumpType=JumpType::Auto);
 
+	/**
+	 *  Simple find and replace with masking in kernel memory
+	 *
+	 *  @param data           kernel memory
+	 *  @param dataSize           size of kernel memory
+	 *  @param find           find pattern
+	 *  @param findSize           size of find pattern
+	 *  @param findMask           find masking pattern
+	 *  @param findMaskSize           size of find masking pattern
+	 *  @param replace           replace pattern
+	 *  @param replaceSize           size of replace pattern
+	 *  @param replaceMask           replace masking pattern
+	 *  @param replaceMaskSize           repalce masking pattern
+	 *  @param count           maximum times of patching
+	 *  @param skip           number of skipping times before performing replacement
+	 *
+	 *  @return true if the finding and replacing performance is successful
+	 */
+	static bool findAndReplaceWithMaskInternal(void *data, size_t dataSize, const void *find, size_t findSize, const void *findMask, size_t findMaskSize, const void *replace, size_t replaceSize, const void *replaceMask, size_t replaceMaskSize, size_t count, size_t skip);
+
 #ifdef LILU_KEXTPATCH_SUPPORT
 	/**
-	 *  Called at kext loading and unloading if kext listening is enabled
+	 *  Process loaded kext
 	 */
-	static void onKextSummariesUpdated();
-
-	/**
-	 *  A pointer to loaded kext information
-	 */
-	OSKextLoadedKextSummaryHeaderAny **loadedKextSummaries {nullptr};
-
-	/**
-	 *  A pointer to kext summaries update
-	 */
-	void (*orgUpdateLoadedKextSummaries)(void) {nullptr};
-
+	void processKext(kmod_info_t *kmod, bool loaded);
+	
 	/**
 	 *  Process already loaded kexts once at the start
 	 *
-	 *  @param summaries loaded kext summaries
-	 *  @param num       number of loaded kext summaries
 	 */
-	void processAlreadyLoadedKexts(OSKextLoadedKextSummaryHeaderAny *summaries, size_t num);
+	void processAlreadyLoadedKexts();
+
+	/**
+	 *  Pointer to loaded kmods for kexts
+	 */
+	kmod_info_t **kextKmods {nullptr};
+
+	/**
+	 *  Called at kext unloading if kext listening is enabled on macOS 10.6 and newer
+	 */
+	static OSReturn onOSKextUnload(void *thisKext);
+
+	/**
+	 *  A pointer to OSKext::unload()
+	 */
+	mach_vm_address_t orgOSKextUnload {};
+
+	/**
+	 *  Called at kext loading and unloading if kext listening is enabled on macOS 10.6 and newer
+	 */
+	static void onOSKextSaveLoadedKextPanicList();
+
+	/**
+	 *  A pointer to OSKext::saveLoadedKextPanicList()
+	 */
+	mach_vm_address_t orgOSKextSaveLoadedKextPanicList {};
+	
+#if defined(__i386__)
+	/**
+	 *  Called at kext loading if kext listening is enabled on macOS 10.4 and 10.5
+	 */
+	static kern_return_t onKmodCreateInternal(kmod_info_t *kmod, kmod_t *id);
+	
+	/**
+	 *  A pointer to kmod_create_internal()
+	 */
+	mach_vm_address_t orgKmodCreateInternal {};
+#endif
 
 #endif /* LILU_KEXTPATCH_SUPPORT */
 
@@ -751,9 +816,9 @@ private:
 	bool waitingForAlreadyLoadedKexts {false};
 
 	/**
-	 *  Number of processed kext summaries
+	 *  Flag to prevent kext processing during an unload
 	 */
-	uint32_t numSummaries {0};
+	bool isKextUnloading {false};
 
 #endif /* LILU_KEXTPATCH_SUPPORT */
 
@@ -767,7 +832,7 @@ private:
 	 *  Jump instruction sizes
 	 */
 	static constexpr size_t SmallJump {1 + sizeof(int32_t)};
-	static constexpr size_t LongJump {6 + sizeof(uint64_t)};
+	static constexpr size_t LongJump {6 + sizeof(uintptr_t)};
 	static constexpr size_t MediumJump {6};
 	static constexpr uint8_t SmallJumpPrefix {0xE9};
 	static constexpr uint16_t LongJumpPrefix {0x25FF};
@@ -777,12 +842,12 @@ private:
 	 */
 	union FunctionPatch {
 		struct PACKED LongPatch {
-			uint16_t opcode;
-			uint32_t argument;
-			uint64_t disp;
-			uint8_t  org[2];
+			uint16_t  opcode;
+			uint32_t  argument;
+			uintptr_t disp;
+			uint8_t   org[sizeof(uint64_t) - sizeof(uintptr_t) + sizeof(uint16_t)];
 		} l;
-		static_assert(sizeof(l) == sizeof(unsigned __int128), "Invalid long patch rounding");
+		static_assert(sizeof(l) == (sizeof(uint64_t) * 2), "Invalid long patch rounding");
 		struct PACKED MediumPatch {
 			uint16_t opcode;
 			uint32_t argument;
@@ -802,14 +867,16 @@ private:
 				reinterpret_cast<volatile T *>(this)->org[i] = *reinterpret_cast<uint8_t *>(source + offsetof(T, org) + i);
 		}
 		uint64_t value64;
+#if defined(__x86_64__)
 		unsigned __int128 value128;
+#endif
 	} patch;
 
 	/**
 	 *  Possible kernel paths
 	 */
 #ifdef LILU_COMPRESSION_SUPPORT
-	const char *prelinkKernelPaths[6] {
+	const char *prelinkKernelPaths[7] {
 		// This is the usual kernel cache place, which often the best thing to use
 		"/System/Library/Caches/com.apple.kext.caches/Startup/kernelcache",
 		// Otherwise fallback to one of the prelinked kernels
@@ -818,7 +885,8 @@ private:
 		"/macOS Install Data/Locked Files/Boot Files/prelinkedkernel", // 10.13 installer
 		"/com.apple.boot.R/prelinkedkernel", // 10.12+ fusion drive installer
 		"/com.apple.boot.S/System/Library/PrelinkedKernels/prelinkedkernel", // 10.11 fusion drive installer
-		"/com.apple.recovery.boot/prelinkedkernel" // recovery
+		"/com.apple.recovery.boot/prelinkedkernel", // recovery
+		"/kernelcache" // 10.7 installer
 	};
 #endif
 
